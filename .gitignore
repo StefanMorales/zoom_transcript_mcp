@@ -17,6 +17,13 @@ dist/
 
 # User data
 transcripts/
+hints.json
+logs/
+*.log
+
+# Personal automation (this repo just documents the pattern; your own scheduler/paths belong
+# outside version control since they're specific to your machine)
+daily_pull.sh
 
 # IDE and editor files
 .idea/

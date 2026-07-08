@@ -1,0 +1,27 @@
+{
+  "_comment": "Routing metadata only — copy this to hints.json (or set ROUTING_HINTS_FILE to point elsewhere) and fill in your own. Never include your own name here; you're a participant in every meeting and would match everything.",
+  "entries": {
+    "acme-corp": {
+      "domain": "Clients",
+      "participant_names": [
+        "Jane Doe",
+        "John Smith"
+      ],
+      "email_domains": [
+        "acme.example.com"
+      ],
+      "topic_keywords": [
+        "Acme",
+        "Acme Corp"
+      ]
+    },
+    "example-collaborator": {
+      "domain": "Collaborators",
+      "participant_names": [
+        "Alex Rivera"
+      ],
+      "email_domains": [],
+      "topic_keywords": []
+    }
+  }
+}

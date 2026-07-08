@@ -16,6 +16,7 @@ import natural from 'natural';
 const ZOOM_ACCOUNT_ID = process.env.ZOOM_ACCOUNT_ID;
 const ZOOM_CLIENT_ID = process.env.ZOOM_CLIENT_ID;
 const ZOOM_CLIENT_SECRET = process.env.ZOOM_CLIENT_SECRET;
+const ZOOM_USER_EMAIL = process.env.ZOOM_USER_EMAIL;
 const TRANSCRIPTS_DIR = process.env.TRANSCRIPTS_DIR || path.join(process.cwd(), 'transcripts');
 
 // Debug environment variables
@@ -23,11 +24,12 @@ console.error('Environment variables:');
 console.error(`ZOOM_ACCOUNT_ID: ${ZOOM_ACCOUNT_ID ? 'Set' : 'Not set'}`);
 console.error(`ZOOM_CLIENT_ID: ${ZOOM_CLIENT_ID ? 'Set' : 'Not set'}`);
 console.error(`ZOOM_CLIENT_SECRET: ${ZOOM_CLIENT_SECRET ? 'Set' : 'Not set'}`);
+console.error(`ZOOM_USER_EMAIL: ${ZOOM_USER_EMAIL ? 'Set' : 'Not set'}`);
 console.error(`TRANSCRIPTS_DIR: ${TRANSCRIPTS_DIR}`);
 
 // Validate required environment variables
-if (!ZOOM_ACCOUNT_ID || !ZOOM_CLIENT_ID || !ZOOM_CLIENT_SECRET) {
-  throw new Error('Missing required environment variables: ZOOM_ACCOUNT_ID ZOOM_CLIENT_ID ZOOM_CLIENT_SECRET');
+if (!ZOOM_ACCOUNT_ID || !ZOOM_CLIENT_ID || !ZOOM_CLIENT_SECRET || !ZOOM_USER_EMAIL) {
+  throw new Error('Missing required environment variables: ZOOM_ACCOUNT_ID ZOOM_CLIENT_ID ZOOM_CLIENT_SECRET ZOOM_USER_EMAIL');
 }
 
 // Ensure transcripts directory exists
@@ -154,7 +156,8 @@ class ZoomClient {
   constructor(
     private accountId: string,
     private clientId: string,
-    private clientSecret: string
+    private clientSecret: string,
+    private userEmail: string
   ) {
     this.axiosInstance = axios.create({
       baseURL: 'https://api.zoom.us/v2',
@@ -214,70 +217,155 @@ class ZoomClient {
     }
   }
   
-  async listRecordings(params: { from?: string; to?: string; page_size?: number; next_page_token?: string } = {}): Promise<any> {
+  // NOTE: if auto-transcript is on but auto-*recording* is off (a common setup — avoids
+  // Zoom cloud storage bloat), transcripts come from AI Companion's meeting-summary
+  // feature, which is a completely separate data model from Cloud Recording. They are
+  // NOT reachable through /recordings at all, regardless of scopes or retention settings.
+  // They live in a different resource: past meeting instances -> per-instance transcript.
+  // This is the fix this fork makes over upstream, which only ever implemented the
+  // Cloud Recording path and will silently return zero results in this configuration.
+
+  async listPastInstances(meetingId: string): Promise<Array<{ uuid: string; start_time: string }>> {
+    const response = await this.axiosInstance.get(`/past_meetings/${meetingId}/instances`);
+    return response.data.meetings || [];
+  }
+
+  async getTranscriptInfo(instanceUuid: string): Promise<{
+    download_url: string;
+    can_download: boolean;
+    meeting_topic: string;
+    transcript_created_time: string;
+  }> {
+    // Zoom quirk: UUIDs containing '/' (or starting with it) must be double-encoded.
+    const encoded = instanceUuid.includes('/') || instanceUuid.startsWith('/')
+      ? encodeURIComponent(encodeURIComponent(instanceUuid))
+      : encodeURIComponent(instanceUuid);
+    const response = await this.axiosInstance.get(`/meetings/${encoded}/transcript`);
+    return response.data;
+  }
+
+  async listRecordings(params: { from?: string; to?: string; page_size?: number } = {}): Promise<{ meetings: ZoomMeeting[] }> {
     try {
-      // Set default parameters if not provided
-      const defaultParams = {
-        page_size: params.page_size || 30,
-        from: params.from || '2024-01-01',
-        ...params
+      // Zoom's Report API hard-limits any single query to within the last 6 months —
+      // older ranges error outright, regardless of account retention settings. Default
+      // to the widest queryable window rather than a stale hardcoded date.
+      const to = params.to ? new Date(params.to) : new Date();
+      const from = params.from ? new Date(params.from) : new Date(to);
+      if (!params.from) from.setMonth(from.getMonth() - 6);
+      const fmt = (d: Date) => d.toISOString().split('T')[0];
+
+      const rawMeetings: any[] = [];
+      let nextPageToken: string | undefined;
+      do {
+        const response = await this.axiosInstance.get(
+          `/report/users/${encodeURIComponent(this.userEmail)}/meetings`,
+          {
+            params: {
+              page_size: params.page_size || 300, // Zoom's max page size for this endpoint
+              from: fmt(from),
+              to: fmt(to),
+              next_page_token: nextPageToken,
+            },
+          }
+        );
+        rawMeetings.push(...(response.data.meetings || []));
+        nextPageToken = response.data.next_page_token || undefined;
+      } while (nextPageToken);
+
+      console.error(`Report API returned ${rawMeetings.length} past meeting(s)`);
+
+      // Enrich each meeting with transcript availability. This is N+1 API calls,
+      // acceptable for the small page sizes this tool is designed for.
+      const meetings: ZoomMeeting[] = [];
+      for (const m of rawMeetings) {
+        const meeting: ZoomMeeting = {
+          id: String(m.id),
+          uuid: m.uuid,
+          topic: m.topic,
+          start_time: m.start_time,
+          duration: m.duration,
+          total_size: 0,
+          recording_count: 0,
+          recording_files: [],
+        };
+        try {
+          const info = await this.getTranscriptInfo(m.uuid);
+          if (info.can_download) {
+            meeting.recording_files = [{
+              id: m.uuid,
+              meeting_id: meeting.id,
+              recording_start: m.start_time,
+              recording_end: m.start_time,
+              file_type: 'TRANSCRIPT',
+              file_size: 0,
+              play_url: '',
+              download_url: info.download_url,
+              status: 'completed',
+              recording_type: 'ai_companion_transcript',
+            }];
+          }
+        } catch {
+          // No transcript for this instance — leave recording_files empty, not an error.
+        }
+        meetings.push(meeting);
+      }
+
+      return { meetings };
+    } catch (error) {
+      console.error('Failed to list past meetings. Detailed error:', error);
+      if (axios.isAxiosError(error)) {
+        console.error('Response data:', error.response?.data);
+        console.error('Response status:', error.response?.status);
+      }
+      throw new Error('Failed to list Zoom past meetings');
+    }
+  }
+
+  async getRecording(meetingId: string): Promise<ZoomMeeting> {
+    try {
+      console.error(`Attempting to get AI Companion transcript for meeting ${meetingId}`);
+
+      const instances = await this.listPastInstances(meetingId);
+      if (instances.length === 0) {
+        throw new Error(`No past instances found for meeting ${meetingId}`);
+      }
+      // Most recent instance
+      const instance = instances[instances.length - 1];
+      const info = await this.getTranscriptInfo(instance.uuid);
+
+      const meeting: ZoomMeeting = {
+        id: meetingId,
+        uuid: instance.uuid,
+        topic: info.meeting_topic,
+        start_time: instance.start_time,
+        duration: 0,
+        total_size: 0,
+        recording_count: info.can_download ? 1 : 0,
+        recording_files: info.can_download ? [{
+          id: instance.uuid,
+          meeting_id: meetingId,
+          recording_start: instance.start_time,
+          recording_end: instance.start_time,
+          file_type: 'TRANSCRIPT',
+          file_size: 0,
+          play_url: '',
+          download_url: info.download_url,
+          status: 'completed',
+          recording_type: 'ai_companion_transcript',
+        }] : [],
       };
-      
-      console.error('Attempting to list recordings with params:', defaultParams);
-      console.error('Using account ID:', this.accountId);
-      console.error('Using client ID:', this.clientId);
-      
-      const response = await this.axiosInstance.get('/users/me/recordings', { params: defaultParams });
-      console.error('Recordings response received:', response.status);
-      console.error('Total records:', response.data.total_records);
-      console.error('Meetings count:', response.data.meetings?.length || 0);
-      
-      return response.data;
+
+      return meeting;
     } catch (error) {
-      console.error('Failed to list recordings. Detailed error:', error);
+      console.error(`Failed to get transcript for meeting ${meetingId}:`, error);
       if (axios.isAxiosError(error)) {
         console.error('Response data:', error.response?.data);
         console.error('Response status:', error.response?.status);
       }
-      throw new Error('Failed to list Zoom recordings');
+      throw new Error(`Failed to get Zoom transcript for meeting ${meetingId}`);
     }
   }
-  
-  async getRecording(meetingId: string): Promise<any> {
-    try {
-      console.error(`Attempting to get recording for meeting ${meetingId}`);
-      
-      // First try to find the meeting in the list of recordings
-      const recordings = await this.listRecordings({
-        page_size: 30,
-        from: '2024-01-01',
-      });
-      
-      // Try to find the meeting by ID or UUID
-      const meeting = recordings.meetings?.find((m: ZoomMeeting) => 
-        m.id === meetingId || m.uuid === meetingId
-      );
-      
-      if (meeting) {
-        console.error(`Found meeting in recordings list: ${meeting.topic}`);
-        return meeting;
-      }
-      
-      // If not found in the list, try to get it directly
-      console.error(`Meeting not found in recordings list, trying direct API call`);
-      const response = await this.axiosInstance.get(`/meetings/${meetingId}/recordings`);
-      console.error(`Direct API call successful`);
-      return response.data;
-    } catch (error) {
-      console.error(`Failed to get recording for meeting ${meetingId}:`, error);
-      if (axios.isAxiosError(error)) {
-        console.error('Response data:', error.response?.data);
-        console.error('Response status:', error.response?.status);
-      }
-      throw new Error(`Failed to get Zoom recording for meeting ${meetingId}`);
-    }
-  }
-  
+
   async downloadTranscript(downloadUrl: string): Promise<string> {
     try {
       const response = await axios.get(downloadUrl, {
@@ -439,7 +527,9 @@ class FileSystemManager {
     for (const metadata of transcripts) {
       try {
         const content = await this.readTranscript(metadata.filePath);
-        const lines = content.split('\n');
+        // Normalize CRLF first: JS regex "." doesn't match "\r", which silently breaks
+        // "$"-anchored patterns against VTT's \r\n line endings otherwise.
+        const lines = content.replace(/\r\n/g, '\n').split('\n');
         const matches: string[] = [];
         
         // Process VTT file
@@ -528,7 +618,7 @@ class FileSystemManager {
   
   async extractActionItems(transcriptContent: string, metadata: TranscriptMetadata): Promise<ActionItem[]> {
     const actionItems: ActionItem[] = [];
-    const lines = transcriptContent.split('\n');
+    const lines = transcriptContent.replace(/\r\n/g, '\n').split('\n');
     
     // Process VTT file to find action items
     let currentText = '';
@@ -602,16 +692,24 @@ class FileSystemManager {
           }
         }
       } else if (inCue) {
-        // Extract speaker if available
-        const speakerMatch = line.match(/<v ([^>]+)>/);
-        if (speakerMatch && speakerMatch[1]) {
-          currentSpeaker = speakerMatch[1].trim();
+        // Extract speaker if available. Cloud Recording VTT uses "<v Name>" tags;
+        // AI Companion VTT instead prefixes the cue's first line with "Name: ".
+        if (currentText === '') {
+          const vTagMatch = line.match(/<v ([^>]+)>/);
+          if (vTagMatch && vTagMatch[1]) {
+            currentSpeaker = vTagMatch[1].trim();
+          } else {
+            const speakerLineMatch = line.match(/^([^:]{2,60}):\s(.*)$/);
+            if (speakerLineMatch) {
+              currentSpeaker = speakerLineMatch[1].trim();
+            }
+          }
         }
-        
+
         currentText += ' ' + line;
       }
     }
-    
+
     return actionItems;
   }
 }
@@ -638,7 +736,8 @@ class ZoomTranscriptsServer {
     this.zoomClient = new ZoomClient(
       ZOOM_ACCOUNT_ID!,
       ZOOM_CLIENT_ID!,
-      ZOOM_CLIENT_SECRET!
+      ZOOM_CLIENT_SECRET!,
+      ZOOM_USER_EMAIL!
     );
     
     this.fileManager = new FileSystemManager(TRANSCRIPTS_DIR);
@@ -1141,40 +1240,23 @@ class ZoomTranscriptsServer {
     }
     
     const meetingId = args.meetingId;
-    
+
     try {
-      // First try to get the meeting from the list of recordings
-      const recordings = await this.zoomClient.listRecordings({
-        page_size: 30,
-        from: '2024-01-01',
-      });
-      
-      console.error(`Looking for meeting ID ${meetingId} in ${recordings.meetings?.length || 0} meetings`);
-      
-      // Debug: Print all meeting IDs
-      if (recordings.meetings && recordings.meetings.length > 0) {
-        console.error('Available meeting IDs:');
-        recordings.meetings.forEach((m: ZoomMeeting) => {
-          console.error(`- ${m.id} (${m.topic})`);
-        });
-      }
-      
-      // Try to find the meeting by ID or UUID
-      const meeting = recordings.meetings?.find((m: ZoomMeeting) => 
-        m.id === meetingId || m.uuid === meetingId
-      );
-      
+      // Direct per-meeting lookup (past instances -> transcript resource). Doesn't need
+      // the bulk Report API listing, so this works with just the transcript-read scopes.
+      const meeting = await this.zoomClient.getRecording(meetingId);
+
       if (!meeting) {
         return {
           content: [
             {
               type: 'text',
-              text: `Meeting ID ${meetingId} not found in your recordings.`,
+              text: `Meeting ID ${meetingId} not found.`,
             },
           ],
         };
       }
-      
+
       // Find transcript file
       const transcriptFile = meeting.recording_files?.find(
         (file: ZoomRecordingFile) => file.file_type === 'TRANSCRIPT'
@@ -1681,17 +1763,36 @@ class ZoomTranscriptsServer {
   
   private extractParticipantsFromTranscript(transcript: string): string[] {
     const participants = new Set<string>();
-    const lines = transcript.split('\n');
-    
-    // Process VTT file to extract speaker names
+    const lines = transcript.replace(/\r\n/g, '\n').split('\n');
+    let inCue = false;
+    let isFirstLineOfCue = false;
+
+    // Process VTT file to extract speaker names. Cloud Recording VTT uses "<v Name>"
+    // tags; AI Companion VTT instead prefixes the cue's first line with "Name: ".
     for (const line of lines) {
-      // Look for speaker identification in format "<v Speaker Name>"
-      const match = line.match(/<v ([^>]+)>/);
-      if (match && match[1]) {
-        participants.add(match[1].trim());
+      if (line.includes('-->')) {
+        inCue = true;
+        isFirstLineOfCue = true;
+        continue;
       }
+      if (line.trim() === '') {
+        inCue = false;
+        continue;
+      }
+      if (!inCue) continue;
+
+      const vTagMatch = line.match(/<v ([^>]+)>/);
+      if (vTagMatch && vTagMatch[1]) {
+        participants.add(vTagMatch[1].trim());
+      } else if (isFirstLineOfCue) {
+        const speakerLineMatch = line.match(/^([^:]{2,60}):\s(.*)$/);
+        if (speakerLineMatch) {
+          participants.add(speakerLineMatch[1].trim());
+        }
+      }
+      isFirstLineOfCue = false;
     }
-    
+
     return Array.from(participants);
   }
   
