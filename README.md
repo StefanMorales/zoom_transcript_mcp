@@ -20,7 +20,7 @@ This fork:
 - Adds `force_route.mjs` — manually file specific staged transcripts to a known destination, for cases you've confirmed by hand that the router's "exactly one candidate" rule can't resolve (e.g. a participant who genuinely spans two relationships)
 - Adds `audit_hints_coverage.mjs` — read-only report of recurring participants (2+ meetings) in each hints-entry's already-filed folder who aren't yet covered by that entry's own `participant_names`, to catch coverage gaps before they cause a misfile
 - Adds optional Telegram notifications (`telegram.mjs`, `test_telegram.mjs`) — `route_transcripts.mjs` pings a Telegram chat with a daily summary (auto-sorted + needs-your-call) whenever it processes anything; stays a silent no-op if unset
-- Fixes a real matching bug in `route_transcripts.mjs`: participant/topic matching used raw substring checks, so short names falsely matched as prefixes of unrelated longer ones (e.g. "Cyn" inside "Cynthia"); now uses word-boundary matching. That boundary check is Unicode-aware (not JS's native `\b`, which only treats `[A-Za-z0-9_]` as word characters and silently fails to match names ending in accented letters, e.g. "Maljković")
+- Fixes a real matching bug in `route_transcripts.mjs`: participant/topic matching used raw substring checks, so short names falsely matched as prefixes of unrelated longer ones (e.g. "Cyn" inside "Cynthia"); now uses word-boundary matching. That boundary check is Unicode-aware (not JS's native `\b`, which only treats `[A-Za-z0-9_]` as word characters and silently fails to match names ending in accented letters, e.g. "Renée")
 
 ### A separate, undocumented Report API bug
 
@@ -210,7 +210,7 @@ If you already know a meeting ID exists and is within range but it never shows u
 `backfill_transcripts.mjs`, don't assume it's unreachable — pull it directly instead:
 
 ```bash
-node --env-file=.env pull_by_meeting_ids.mjs path/to/ids.json   # ids.json: ["86865991467", ...]
+node --env-file=.env pull_by_meeting_ids.mjs path/to/ids.json   # ids.json: ["123456789012", ...]
 ```
 
 This queries `past_meetings/{id}/instances` per ID instead of the bulk date-range listing, and

@@ -8,7 +8,7 @@
 // Usage:
 //   node pull_by_meeting_ids.mjs <path-to-json-array-of-ids>
 //
-// The JSON file should be a plain array of meeting ID strings, e.g. ["86865991467", ...].
+// The JSON file should be a plain array of meeting ID strings, e.g. ["123456789012", ...].
 // Writes into the same transcripts/YYYY-MM/ + metadata/ convention as backfill_transcripts.mjs,
 // and skips anything already in .routed-state.json so re-runs don't re-download duplicates.
 

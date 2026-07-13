@@ -14,7 +14,7 @@ const WORKSPACE_DIR = path.resolve(__dirname, '..', '..', '..');
 const HINTS_FILE = path.join(__dirname, '..', '..', '..', 'Clients', '_routing', 'hints.json');
 
 const IGNORE_NAMES = new Set([
-  'stefan morales (he/they)', 'iphone', 'iphone 17 air', "melinda's iphone", "phil's iphone (2)",
+  'your name (he/they)', 'iphone', 'iphone 17 air', "someone's iphone", "someone's iphone (2)",
 ]);
 
 // Unicode-aware — see the matching note in route_transcripts.mjs's containsAsWholeName.

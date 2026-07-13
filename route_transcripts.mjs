@@ -68,7 +68,7 @@ async function findMetadataFiles(dir) {
 // (e.g. two different "Anna"s) — that's intentional ambiguity, not a bug this fixes.
 //
 // Uses Unicode-aware lookaround instead of \b: JS's native \b only treats [A-Za-z0-9_] as
-// "word" characters, so a name ending in an accented letter (e.g. "Maljković", "Timothée")
+// "word" characters, so a name ending in an accented letter (e.g. "Renée", "Zoë")
 // silently fails to match at that boundary with plain \b — confirmed as a real bug hitting
 // real hints entries, not a theoretical edge case.
 function containsAsWholeName(haystack, needle) {
