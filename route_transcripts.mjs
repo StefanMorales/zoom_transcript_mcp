@@ -12,6 +12,7 @@
 import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { notifyTelegram } from './telegram.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SOURCE_DIR = path.join(__dirname, 'transcripts');
@@ -61,6 +62,20 @@ async function findMetadataFiles(dir) {
   return results;
 }
 
+// Whole-word-boundary containment, not raw substring — "Cyn" must not match "Cynthia" (no
+// boundary after the shared prefix), but should match "cyn vasquez" (boundary at the space).
+// A short display name and a short hint can still collide on a genuinely shared real name
+// (e.g. two different "Anna"s) — that's intentional ambiguity, not a bug this fixes.
+//
+// Uses Unicode-aware lookaround instead of \b: JS's native \b only treats [A-Za-z0-9_] as
+// "word" characters, so a name ending in an accented letter (e.g. "Maljković", "Timothée")
+// silently fails to match at that boundary with plain \b — confirmed as a real bug hitting
+// real hints entries, not a theoretical edge case.
+function containsAsWholeName(haystack, needle) {
+  const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(?<![\\p{L}\\p{N}_])${escaped}(?![\\p{L}\\p{N}_])`, 'iu').test(haystack);
+}
+
 function scoreClient(metadata, hint) {
   let score = 0;
   const reasons = [];
@@ -69,14 +84,16 @@ function scoreClient(metadata, hint) {
 
   for (const name of hint.participant_names || []) {
     const nameLower = name.toLowerCase();
-    const hit = participantsLower.some((p) => p.includes(nameLower) || nameLower.includes(p));
+    const hit = participantsLower.some(
+      (p) => containsAsWholeName(p, nameLower) || containsAsWholeName(nameLower, p)
+    );
     if (hit) {
       score += 2;
       reasons.push(`participant match: "${name}"`);
     }
   }
   for (const kw of hint.topic_keywords || []) {
-    if (topicLower.includes(kw.toLowerCase())) {
+    if (containsAsWholeName(topicLower, kw.toLowerCase())) {
       score += 1;
       reasons.push(`topic keyword: "${kw}"`);
     }
@@ -84,8 +101,17 @@ function scoreClient(metadata, hint) {
   return { score, reasons };
 }
 
+// A hints "name" can itself already end in a /meetings/<subfolder> path (e.g. nesting
+// several people's meetings under one shared folder's own meetings/ dir) — in that case
+// don't append another 'meetings' segment on top of it.
+function resolveDestDir(name) {
+  return /(^|\/)meetings(\/|$)/.test(name)
+    ? path.join(WORKSPACE_DIR, name)
+    : path.join(WORKSPACE_DIR, name, 'meetings');
+}
+
 async function routeToEntry(domain, name, metadata, sourceMetaPath) {
-  const destDir = path.join(WORKSPACE_DIR, domain, name, 'meetings');
+  const destDir = resolveDestDir(path.join(domain, name));
   const destMetaDir = path.join(destDir, 'metadata');
   await fs.mkdir(destDir, { recursive: true });
   await fs.mkdir(destMetaDir, { recursive: true });
@@ -166,7 +192,7 @@ async function main() {
 
   console.log(`\n=== Routed (${routed.length}) ===`);
   for (const r of routed) {
-    console.log(`- "${r.topic}" -> ${r.domain}/${r.name}/meetings/ (${r.reasons.join(', ')})`);
+    console.log(`- "${r.topic}" -> ${path.relative(WORKSPACE_DIR, path.dirname(r.destPath))}/ (${r.reasons.join(', ')})`);
   }
 
   console.log(`\n=== Ambiguous — needs your call (${ambiguous.length}) ===`);
@@ -182,6 +208,50 @@ async function main() {
     console.log(`- "${u.topic}" (${u.startTime}) — participants: ${(u.participants || []).join(', ') || 'none captured'}`);
   }
   console.log(`\nUnmatched/ambiguous transcripts stay in ${SOURCE_DIR} and will be re-reported until hints.json is updated or they're handled manually.`);
+
+  // Daily summary ping — sends every run that actually found transcripts to process, whether
+  // or not anything needs a manual call, so "no news" reads as confirmation, not silence.
+  // Only genuinely skips when there was nothing at all to report (no transcripts that day).
+  const totalSeen = routed.length + ambiguous.length + unmatched.length + staleCleaned;
+  if (totalSeen > 0) {
+    const needsInput = ambiguous.length + unmatched.length;
+    const dateStr = new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' });
+    const lines = [
+      `🎩 Sorting hat — ${dateStr}`,
+      `${routed.length} auto-sorted, ${needsInput} need${needsInput === 1 ? 's' : ''} your call` +
+        (staleCleaned > 0 ? `, ${staleCleaned} already filed` : ''),
+      '',
+    ];
+
+    if (routed.length > 0) {
+      lines.push(`✅ Auto-sorted (${routed.length}):`);
+      for (const r of routed) lines.push(`• "${r.topic}" → ${path.relative(WORKSPACE_DIR, path.dirname(r.destPath))}/`);
+      lines.push('');
+    }
+
+    if (needsInput > 0) {
+      lines.push(`⚠️ Needs your call (${needsInput}):`);
+      for (const a of ambiguous) lines.push(`• "${a.topic}" — ambiguous (${a.candidates.map((c) => c.name).join(' vs ')})`);
+      for (const u of unmatched) lines.push(`• "${u.topic}" — unmatched`);
+    } else if (routed.length > 0 || staleCleaned > 0) {
+      lines.push(`Nothing needs your input today 🎉`);
+    }
+
+    // Telegram caps messages around 4096 chars — chunk so a big batch doesn't silently fail.
+    const MAX_CHARS = 3500;
+    const chunks = [];
+    let current = '';
+    for (const line of lines) {
+      if (current.length + line.length + 1 > MAX_CHARS) { chunks.push(current); current = ''; }
+      current += (current ? '\n' : '') + line;
+    }
+    if (current) chunks.push(current);
+
+    for (let i = 0; i < chunks.length; i++) {
+      const prefix = chunks.length > 1 ? `(${i + 1}/${chunks.length})\n` : '';
+      await notifyTelegram(prefix + chunks[i]);
+    }
+  }
 }
 
 main().catch((err) => {

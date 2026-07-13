@@ -14,7 +14,22 @@ This fork:
 - Handles both speaker-label formats (Cloud Recording's `<v Speaker Name>` tags and AI Companion's `"Speaker Name: "` line-prefix convention)
 - Fixes pagination (the original had a silent 30-result cap with no `next_page_token` handling) and a stale hardcoded date default that would now always be outside Zoom's queryable window
 - Adds `backfill_transcripts.mjs` — a standalone script for bulk-pulling a window of history directly by meeting-instance UUID, since recurring meetings (same meeting ID, many occurrences) otherwise collapse to "latest instance only" through the MCP tool
+- Adds `pull_by_meeting_ids.mjs` — works around a separate, undocumented Report API bug (see below): pulls specific meeting IDs directly via `past_meetings/{id}/instances` instead of the bulk date-range listing
+- Adds `import_transcript.mjs` — manually import `.vtt` file(s) downloaded by hand from Zoom's web portal (e.g. older than the 6-month backfill window), single file or a whole folder at once
 - Adds `route_transcripts.mjs` — a standalone script that sorts downloaded transcripts into folders by matching participants/topic against a hints file, auto-filing only on an unambiguous match and leaving anything uncertain for you to sort by hand rather than guessing
+- Adds `force_route.mjs` — manually file specific staged transcripts to a known destination, for cases you've confirmed by hand that the router's "exactly one candidate" rule can't resolve (e.g. a participant who genuinely spans two relationships)
+- Adds `audit_hints_coverage.mjs` — read-only report of recurring participants (2+ meetings) in each hints-entry's already-filed folder who aren't yet covered by that entry's own `participant_names`, to catch coverage gaps before they cause a misfile
+- Adds optional Telegram notifications (`telegram.mjs`, `test_telegram.mjs`) — `route_transcripts.mjs` pings a Telegram chat with a daily summary (auto-sorted + needs-your-call) whenever it processes anything; stays a silent no-op if unset
+- Fixes a real matching bug in `route_transcripts.mjs`: participant/topic matching used raw substring checks, so short names falsely matched as prefixes of unrelated longer ones (e.g. "Cyn" inside "Cynthia"); now uses word-boundary matching. That boundary check is Unicode-aware (not JS's native `\b`, which only treats `[A-Za-z0-9_]` as word characters and silently fails to match names ending in accented letters, e.g. "Maljković")
+
+### A separate, undocumented Report API bug
+
+Independent of the documented 6-month cap below: empirically confirmed (2026-07-13) that Zoom's
+Report API bulk date-range listing (`report/users/{id}/meetings`, what `backfill_transcripts.mjs`
+uses) silently drops some real, hosted, in-window meetings — while `past_meetings/{id}/instances`,
+queried per meeting ID, still returns them correctly. If a bulk backfill seems to be missing
+meetings you know exist and are within range, don't assume the gap is unreachable — pull that
+specific meeting ID directly with `pull_by_meeting_ids.mjs` instead.
 
 ## Features
 
@@ -177,11 +192,46 @@ directly from Zoom's Report API, which already lists one entry per instance:
 
 ```bash
 node --env-file=.env backfill_transcripts.mjs        # full 6-month sweep (one-time backfill)
-node --env-file=.env backfill_transcripts.mjs 2       # last 2 days (cheap, for a daily cron)
+node --env-file=.env backfill_transcripts.mjs 7       # last 7 days (for a daily cron — see note below)
 ```
 
 Writes into the same `transcripts/YYYY-MM/` + `metadata/` structure the MCP server uses, so
 `route_transcripts.mjs` (below) can process the results identically either way.
+
+If you're running this on a schedule, use a lookback window comfortably wider than the
+schedule's own interval, not equal to it — the Report API's date range is date-only, not
+timestamp-precise, so e.g. a 2-day lookback on a daily cron can still leave a same-day-but-
+after-the-run gap that never gets swept up. A 7-day lookback on a daily cron costs nothing
+extra (routing is idempotent — see below) and closes that gap.
+
+### Missing meetings the bulk backfill silently drops
+
+If you already know a meeting ID exists and is within range but it never shows up from
+`backfill_transcripts.mjs`, don't assume it's unreachable — pull it directly instead:
+
+```bash
+node --env-file=.env pull_by_meeting_ids.mjs path/to/ids.json   # ids.json: ["86865991467", ...]
+```
+
+This queries `past_meetings/{id}/instances` per ID instead of the bulk date-range listing, and
+has been observed to successfully return meetings the bulk listing silently dropped (see "A
+separate, undocumented Report API bug" above). Also skips anything already in
+`.routed-state.json`, so it's safe to re-run against overlapping ID lists.
+
+### Importing transcripts downloaded by hand
+
+For anything older than the Report API's 6-month window, or otherwise not reachable through
+either script above, `import_transcript.mjs` ingests `.vtt` file(s) you've downloaded manually
+from Zoom's web portal:
+
+```bash
+node import_transcript.mjs <path-to-vtt> "<topic>" <startTimeISO> [durationMinutes]
+node import_transcript.mjs <folder-of-vtts>   # whole folder, guesses topic/time per file
+```
+
+The whole-folder form guesses topic and start time from each filename (Zoom's own
+`GMT<date>-<time>` export convention, or the file's modified time as a fallback) — check the
+printed guesses and hand-edit the written metadata `.json` if one looks wrong before routing.
 
 ## Routing transcripts into folders (standalone script, not an MCP tool)
 
@@ -204,7 +254,37 @@ more matches → reported as ambiguous, not guessed. Zero matches → reported a
 Either way it's left in `transcripts/` and re-reported on every run until you resolve it —
 this script will never silently misfile something it isn't sure about. Once something *is*
 routed, the staging copy is deleted (safe to re-run on an overlapping window, e.g. a daily
-cron with a 2-day lookback — it won't pile up duplicates).
+cron with a wider-than-the-interval lookback — it won't pile up duplicates).
+
+If `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` are set in `.env` (see `.env.example`), every run
+that processed anything sends a Telegram summary — auto-sorted list, then anything needing
+your call, or a "nothing needs input" confirmation if there's nothing ambiguous/unmatched.
+Runs that saw nothing at all stay silent. Test connectivity any time with
+`node --env-file=.env test_telegram.mjs`. Leave both unset to skip Telegram entirely.
+
+### Manually resolving ambiguous/unmatched transcripts
+
+For a transcript the router can't resolve on its own (e.g. a participant who genuinely spans
+two hints entries) but you already know the right destination for:
+
+```bash
+node force_route.mjs <Domain> <name> <metadata-json-path> [<metadata-json-path> ...]
+```
+
+Mirrors the router's own filing logic exactly (including `.routed-state.json` bookkeeping),
+so a manually-forced meeting is indistinguishable from an auto-routed one afterward.
+
+### Auditing hint coverage
+
+```bash
+node audit_hints_coverage.mjs
+```
+
+Read-only report: for each hints entry, scans its already-filed meetings and flags participants
+appearing 2+ times who aren't yet in that entry's own `participant_names` — i.e. people
+currently only routing there via another participant or a topic keyword, not their own name.
+Useful after a manual `force_route.mjs` or a bulk folder move, to catch hints-file drift before
+it causes a future meeting with the same person to fall through as unmatched.
 
 ## Transcript Storage
 
@@ -235,6 +315,12 @@ zoom_transcript_mcp/
 │   └── index.ts
 ├── route_transcripts.mjs
 ├── backfill_transcripts.mjs
+├── pull_by_meeting_ids.mjs
+├── import_transcript.mjs
+├── force_route.mjs
+├── audit_hints_coverage.mjs
+├── telegram.mjs
+├── test_telegram.mjs
 ├── hints.example.json
 ├── package.json
 ├── tsconfig.json
