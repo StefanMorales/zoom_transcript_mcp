@@ -17,6 +17,19 @@ const WORKSPACE_DIR = path.resolve(__dirname, '..', '..', '..');
 const SOURCE_DIR = path.join(__dirname, 'transcripts');
 const STATE_FILE = path.join(SOURCE_DIR, '.routed-state.json');
 
+// Mirrors route_transcripts.mjs's withRetry — a file backfill_transcripts.mjs just wrote can
+// briefly throw EDEADLK here too (see route_transcripts.mjs for the full explanation).
+async function withRetry(fn, { attempts = 5, delayMs = 500 } = {}) {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (err.errno !== -11 || i === attempts - 1) throw err;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+}
+
 async function main() {
   const [domain, name, ...metaPaths] = process.argv.slice(2);
   if (!domain || !name || metaPaths.length === 0) {
@@ -37,17 +50,17 @@ async function main() {
 
   for (const rawPath of metaPaths) {
     const metaPath = path.isAbsolute(rawPath) ? rawPath : path.join(SOURCE_DIR, rawPath);
-    const metadata = JSON.parse(await fs.readFile(metaPath, 'utf-8'));
+    const metadata = JSON.parse(await withRetry(() => fs.readFile(metaPath, 'utf-8')));
 
     const vttName = path.basename(metadata.filePath);
     const destVttPath = path.join(destDir, vttName);
-    await fs.copyFile(metadata.filePath, destVttPath);
+    await withRetry(() => fs.copyFile(metadata.filePath, destVttPath));
 
     const destMetaPath = path.join(destMetaDir, vttName.replace(/\.vtt$/, '.json'));
     await fs.writeFile(destMetaPath, JSON.stringify({ ...metadata, filePath: destVttPath }, null, 2));
 
-    await fs.unlink(metadata.filePath);
-    await fs.unlink(metaPath);
+    await withRetry(() => fs.unlink(metadata.filePath));
+    await withRetry(() => fs.unlink(metaPath));
 
     const key = metadata.id || metadata.meetingId;
     state.routed[key] = { domain, name, routedAt: new Date().toISOString(), destPath: destVttPath };

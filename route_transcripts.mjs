@@ -4,10 +4,10 @@
 // to whatever categories make sense for you.
 //
 // Matches on participant names and topic keywords against a hints file (see
-// ROUTING_HINTS_FILE below and hints.example.json for the schema). Only auto-routes when
-// exactly one entry matches; anything ambiguous (multiple matches) or unmatched (zero
-// matches) is left in place in transcripts/ and reported instead of guessed — never files
-// something it isn't confident about.
+// ROUTING_HINTS_FILE below and hints.example.json for the schema). Auto-routes to whichever
+// entry scores highest; only stays ambiguous on a genuine tie at the top score (multiple
+// matches, zero matches, or a tie) — left in place in transcripts/ and reported instead of
+// guessed — never files something it isn't confident about.
 
 import fs from 'fs/promises';
 import path from 'path';
@@ -28,9 +28,25 @@ const HINTS_FILE = process.env.ROUTING_HINTS_FILE
 
 const STATE_FILE = path.join(SOURCE_DIR, '.routed-state.json');
 
+// A file backfill_transcripts.mjs just wrote (moments ago, in a separate process) can briefly
+// throw EDEADLK on read here — this workspace lives under an iCloud-synced Desktop folder,
+// and CloudDocs sometimes claims a just-written file for upload right as the next process
+// tries to read it back. Self-heals within a second or two; retry rather than surface it as
+// a routing failure.
+async function withRetry(fn, { attempts = 5, delayMs = 500 } = {}) {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (err.errno !== -11 || i === attempts - 1) throw err;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+}
+
 async function loadJson(file, fallback) {
   try {
-    return JSON.parse(await fs.readFile(file, 'utf-8'));
+    return JSON.parse(await withRetry(() => fs.readFile(file, 'utf-8')));
   } catch (err) {
     if (err.code === 'ENOENT') return fallback;
     throw err;
@@ -118,7 +134,7 @@ async function routeToEntry(domain, name, metadata, sourceMetaPath) {
 
   const vttName = path.basename(metadata.filePath);
   const destVttPath = path.join(destDir, vttName);
-  await fs.copyFile(metadata.filePath, destVttPath);
+  await withRetry(() => fs.copyFile(metadata.filePath, destVttPath));
 
   const metaName = vttName.replace(/\.vtt$/, '.json');
   const destMetaPath = path.join(destMetaDir, metaName);
@@ -126,9 +142,11 @@ async function routeToEntry(domain, name, metadata, sourceMetaPath) {
 
   // Copy is confirmed written at this point — safe to remove the staging originals so a
   // recurring routine doesn't pile up stale duplicates in transcripts/ forever. Ambiguous
-  // and unmatched items never reach this function, so they're untouched by design.
-  await fs.unlink(metadata.filePath);
-  await fs.unlink(sourceMetaPath);
+  // and unmatched items never reach this function, so they're untouched by design. Same
+  // EDEADLK race as the copy above can hit these too — retry rather than let it escape
+  // main()'s loop and skip the STATE_FILE write for everything already routed this run.
+  await withRetry(() => fs.unlink(metadata.filePath));
+  await withRetry(() => fs.unlink(sourceMetaPath));
 
   return destVttPath;
 }
@@ -170,17 +188,21 @@ async function main() {
 
     const scored = entryNames
       .map((name) => ({ name, domain: entries[name].domain, ...scoreClient(metadata, entries[name]) }))
-      .filter((c) => c.score > 0);
+      .filter((c) => c.score > 0)
+      .sort((a, b) => b.score - a.score);
 
-    if (scored.length === 1) {
+    if (scored.length === 0) {
+      unmatched.push({ topic: metadata.topic, startTime: metadata.startTime, participants: metadata.participants });
+    } else if (scored.length === 1 || scored[0].score > scored[1].score) {
+      // Either only one candidate fired, or one clearly outscored the rest (e.g. topic
+      // keyword + several participant matches vs. a single shared-first-name collision) —
+      // route to the top scorer. A tie at the top is the only case left ambiguous.
       const { name, domain, reasons } = scored[0];
       const destPath = await routeToEntry(domain, name, metadata, metaPath);
       state.routed[key] = { domain, name, routedAt: new Date().toISOString(), destPath };
       routed.push({ topic: metadata.topic, domain, name, reasons, destPath });
-    } else if (scored.length > 1) {
-      ambiguous.push({ topic: metadata.topic, candidates: scored });
     } else {
-      unmatched.push({ topic: metadata.topic, startTime: metadata.startTime, participants: metadata.participants });
+      ambiguous.push({ topic: metadata.topic, candidates: scored });
     }
   }
 
